@@ -1,0 +1,65 @@
+# Sandboxes may resolve DNS (kube-dns only) and reach public addresses on 80/443. Nothing reaches
+# them (kubectl exec goes API server -> kubelet, not over the Pod network, so no ingress is needed).
+# Blocked by the egress allow-list: RFC1918 (10/8, 172.16/12, 192.168/16), link-local 169.254/16
+# (cloud metadata) and CGNAT 100.64/10 -- which covers most node, LAN and Service ranges.
+# NOT blocked: any node, API-server endpoint or Service CIDR that lives on a PUBLIC (non-RFC1918)
+# address. Add those ranges to `except` for your cluster.
+#
+# This is the portable networking.k8s.io/v1 form. It works with any CNI that enforces NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-egress
+  namespace: agent-sandbox
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  # No ingress rules: deny all ingress.
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+      ports:
+        - {port: 443, protocol: TCP}
+        - {port: 80, protocol: TCP}
+# ---------------------------------------------------------------------------
+# Cilium variant (adds explicit default-deny):
+#
+# apiVersion: cilium.io/v2
+# kind: CiliumNetworkPolicy
+# metadata:
+#   name: sandbox-egress
+#   namespace: agent-sandbox
+# spec:
+#   endpointSelector: {}
+#   enableDefaultDeny: {ingress: true, egress: true}
+#   egress:
+#     - toEndpoints:
+#         - matchLabels:
+#             k8s:io.kubernetes.pod.namespace: kube-system
+#             k8s-app: kube-dns
+#       toPorts:
+#         - ports: [{port: "53", protocol: UDP}, {port: "53", protocol: TCP}]
+#     - toCIDRSet:
+#         - cidr: 0.0.0.0/0
+#           except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+#       toPorts:
+#         - ports: [{port: "443", protocol: TCP}, {port: "80", protocol: TCP}]
+#
+# MANDATORY with Cilium: set `socketLB.hostNamespaceOnly: true` in the Cilium Helm values.
+# Cilium's socket-level load balancer translates Service addresses in the connect() syscall,
+# which never happens for traffic leaving a Kata VM (the guest has its own kernel), so Service
+# connectivity from Kata Pods breaks: in testing, 3 of 6 Service checks failed until it was set.
+# It is a connectivity requirement, not a policy bypass.
+# ---------------------------------------------------------------------------
