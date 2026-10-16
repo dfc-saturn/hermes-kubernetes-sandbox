@@ -14,13 +14,15 @@ import uuid
 
 import httpx
 from tools.environments.base import BaseEnvironment, EnvironmentConnectionError, get_activity_callback
+from tools.environments.remote_common import resolve_passthrough_env
 
+from .credentials import credential_names, git_config_env
 from .exec_stream import ExecDisconnected, ExecFailed, StreamingExecHandle, connect_exec
 from .kube import Conflict, KubeClient, KubeError, NotFound, QuotaExceeded
 from .naming import ANN_LAST_USED, ANN_SESSION_KEY, ANN_UNUSED_SINCE, LBL_PROFILE, LBL_TEMPLATE_HASH, MANAGED_BY, Identity, slug
 from .podspec import identity_labels, render_pod, render_workspace_claim, template_hash
 from .runner import exec_argv, kill_argv, stdin_payload
-from .settings import Settings, interlock_error
+from .settings import _SHELL_NAME, WITHHELD_ENV_PREFIXES, Settings, interlock_error
 
 log = logging.getLogger(__name__)
 _PROCESS_EXITING = False
@@ -53,6 +55,31 @@ _GONE_TIMEOUT = 90
 _SERVED_PODS: dict[str, str | None] = {}
 _SERVED_LOCK = threading.Lock()
 _ACCESS_WARNED: set[str] = set()  # workspace PVCs already warned about an access-mode mismatch
+_WITHHELD_WARNED: set[str] = set()  # names already warned about as withheld credentials
+
+
+def _withheld(name: str) -> bool:
+    """A credential that never enters a sandbox: a name Hermes manages (its own check, the one its env
+    passthrough registry applies: provider and tool API keys, GITHUB_TOKEN/GH_TOKEN, adapter secrets,
+    AUXILIARY_*_API_KEY ...), or an LLM proxy or memory key Hermes does not classify (WITHHELD_ENV_PREFIXES).
+    Hermes lets an EXPLICIT forward (docker_forward_env) bypass its check; this plugin does not. Fails closed: a
+    name that cannot be classified is withheld, logged every time, and never marked as warned."""
+    if name.startswith(WITHHELD_ENV_PREFIXES):
+        reason = "is an LLM proxy or memory key"
+    else:
+        try:
+            from tools.env_passthrough import _is_hermes_provider_credential
+            if not _is_hermes_provider_credential(name):
+                return False
+        except Exception as e:
+            log.warning("forwarded environment: cannot classify %s with Hermes's credential check (%s); "
+                        "withheld", name, type(e).__name__)
+            return True
+        reason = "is a credential Hermes manages"
+    if name not in _WITHHELD_WARNED:
+        _WITHHELD_WARNED.add(name)
+        log.warning("forwarded environment: %s %s; it is not forwarded into sandboxes", name, reason)
+    return True
 
 
 def _served(name: str) -> bool:
@@ -138,6 +165,9 @@ class KubernetesEnvironment(BaseEnvironment):
         self._had_pod = False
         self._pod_uid: str | None = None
         self._bootstrap_attempted = False
+        # Names whose values are forwarded per exec (K11). Monotonic: a name stays excluded from the session
+        # snapshot after its value is gone, so an old value cannot persist there.
+        self._exec_env_names: set[str] = set(settings.forward_env) | credential_names(settings.git_credentials)
 
     # --- Pod lifecycle -------------------------------------------------------
     def _notify(self, msg: str) -> None:
@@ -425,6 +455,38 @@ class KubernetesEnvironment(BaseEnvironment):
             self.init_session()
         self._touch_last_used()
 
+    def _exec_env_script(self) -> str:
+        """The forwarded environment of ONE exec, as shell lines the runner evals (never in an argv, the exec
+        URL or the Pod spec). Values come from Hermes's own resolver: `terminal.env_passthrough` plus the
+        `forward_env` setting, the routed profile's value under multiplexing; names the scope lacks come back
+        to be unset, so another profile's value can never linger. Every RESOLVED name, explicit forward_env
+        and implicit terminal.env_passthrough alike, then passes one withheld-credential check (_withheld):
+        a withheld name is resolved but never emitted. Plus the git credential configuration. Only
+        shell-name-valid names are emitted and every value is shell-quoted; a NUL in a value is refused by
+        stdin_payload."""
+        values, unset = resolve_passthrough_env(self._s.forward_env)
+        values = {k: v for k, v in values.items()
+                  if isinstance(k, str) and _SHELL_NAME.fullmatch(k) and not _withheld(k)}
+        values.update(git_config_env(self._s.git_credentials))
+        unset = {n for n in unset if isinstance(n, str) and _SHELL_NAME.fullmatch(n) and n not in values}
+        self._exec_env_names.update(values)
+        self._exec_env_names.update(unset)
+        lines = [f"export {k}={shlex.quote(v)}" for k, v in sorted(values.items())]
+        if unset:
+            lines.append("unset " + " ".join(sorted(unset)))
+        return "".join(line + "\n" for line in lines)
+
+    def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
+        """Forwarded and git names never enter the session snapshot, multiplexed or not: the snapshot is a
+        file in the Pod's /tmp that every later command sources."""
+        names = set(super()._snapshot_excluded_passthrough_names()) | self._exec_env_names
+        try:
+            from tools.env_passthrough import get_all_passthrough
+            names.update(n for n in get_all_passthrough() if isinstance(n, str))
+        except Exception:
+            pass
+        return tuple(sorted(n for n in names if _SHELL_NAME.fullmatch(n)))
+
     def _start(self, cmd_string, login, timeout, stdin_data):
         exec_id = uuid.uuid4().hex[:12]
         pod = self._id.pod_name
@@ -436,7 +498,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 pass
 
         handle = self._exec(pod, "work", exec_argv(exec_id, login=login, timeout=timeout),
-                            stdin_payload(cmd_string, stdin_data), on_kill)
+                            stdin_payload(cmd_string, stdin_data, self._exec_env_script()), on_kill)
         return handle
 
     def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
@@ -450,11 +512,10 @@ class KubernetesEnvironment(BaseEnvironment):
                 f"Sandbox Pod {self._id.pod_name} is gone",
                 retry_hint="Retry the command; the sandbox Pod is recreated automatically.") from None
 
-    def _wait_for_process(self, proc, timeout=120, *, bounded_capture=False, watch_interrupt_tid=None,
-                          yield_handler=None):
-        result = super()._wait_for_process(
-            proc, timeout, bounded_capture=bounded_capture, watch_interrupt_tid=watch_interrupt_tid,
-            yield_handler=yield_handler)
+    def _wait_for_process(self, proc, timeout=120, **kwargs):
+        # Every keyword goes through unchanged: the base grows parameters between Hermes releases
+        # (v0.22 added `output`), and this override only adds the stream-loss check below.
+        result = super()._wait_for_process(proc, timeout, **kwargs)
         err = getattr(proc, "error", None)
         killed = getattr(proc, "_killed", None)
         if isinstance(err, (ExecDisconnected, ExecFailed)) and not (killed is not None and killed.is_set()):

@@ -63,3 +63,23 @@ spec:
 # connectivity from Kata Pods breaks: in testing, 3 of 6 Service checks failed until it was set.
 # It is a connectivity requirement, not a policy bypass.
 # ---------------------------------------------------------------------------
+# Opt-in forge egress (pairs with `extra_pod_labels: {example.com/forge-egress: "true"}`): sandboxes
+# carrying the label may also reach a forge on a private address, here 10.0.0.10:443 (replace with
+# yours). sandbox-egress above blocks RFC1918, so a LAN or in-cluster forge needs this policy; a forge
+# on a public address is already reachable on 443 and needs nothing extra.
+#
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: sandbox-forge-egress
+#   namespace: agent-sandbox
+# spec:
+#   podSelector:
+#     matchLabels:
+#       example.com/forge-egress: "true"
+#   policyTypes: [Egress]
+#   egress:
+#     - to:
+#         - ipBlock: {cidr: 10.0.0.10/32}
+#       ports:
+#         - {port: 443, protocol: TCP}

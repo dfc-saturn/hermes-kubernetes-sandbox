@@ -2,11 +2,47 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
+import ipaddress
 import os
 import pathlib
 import re
+import urllib.parse
 
-import yaml
+# Tested against Hermes v0.22.1 (pinned in CI). On Hermes v0.22+ settings are parsed with Hermes's
+# internal `hermes_yaml` module (ruamel.yaml; not a stable plugin API -- a rename is caught by the
+# registration test at the next pin bump); on older Hermes, and in the examples tooling that renders
+# Pods outside Hermes, with PyYAML. The choice is by availability, never by import failure: a
+# hermes_yaml that is present but broken must fail with its own cause, not switch parsers.
+# Both loaders reject duplicate keys.
+if importlib.util.find_spec("hermes_yaml") is not None:
+    from hermes_yaml import YAMLError, safe_load
+elif importlib.util.find_spec("yaml") is not None:
+    import yaml
+
+    YAMLError = yaml.YAMLError
+
+    class _UniqueKeySafeLoader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            seen = set()
+            for key_node, _ in node.value:
+                key = self.construct_object(key_node, deep=True)
+                try:
+                    duplicate = key in seen
+                except TypeError:  # unhashable key: the base constructor rejects it with its own error
+                    break
+                if duplicate:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping", node.start_mark,
+                        f"found duplicate key {key!r}", key_node.start_mark)
+                seen.add(key)
+            return super().construct_mapping(node, deep)
+
+    def safe_load(text: str):
+        return yaml.load(text, Loader=_UniqueKeySafeLoader)
+else:
+    raise ImportError("kubernetes-sandbox needs a YAML loader: Hermes's hermes_yaml module (Hermes v0.22+) "
+                      "or PyYAML (older Hermes); neither is installed")
 
 
 def _default_work_image() -> str:
@@ -19,6 +55,14 @@ def _default_work_image() -> str:
 
 class SettingsError(ValueError):
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class GitCredential:
+    """One forge for in-sandbox `git`: answered with `username` and the value of the forwarded `password_env`."""
+    url: str
+    username: str
+    password_env: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,24 +95,69 @@ class Settings:
     token_path: str = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     ca_path: str | None = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
     extra_pod_annotations: dict[str, str] = dataclasses.field(default_factory=dict)
+    extra_pod_labels: dict[str, str] = dataclasses.field(default_factory=dict)
+    forward_env: tuple[str, ...] = ()
+    git_credentials: tuple[GitCredential, ...] = ()
 
 
 _FIELDS = {f.name: f for f in dataclasses.fields(Settings)}
 # Settings whose YAML key (and HERMES_K8S_<KEY> variable) differs from the field name.
 _KEY_TO_FIELD = {"workspace_retention": "workspace_retention_seconds"}
 _KEYS = {**{k: k for k in _FIELDS if k not in _KEY_TO_FIELD.values()}, **_KEY_TO_FIELD}
-_DURATION = re.compile(r"^(\d+)([smhd]?)$")
+_DURATION = re.compile(r"(\d+)([smhd]?)")
 _UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
+# Validators are applied with fullmatch: `$` would also accept a trailing newline.
+_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_LABEL_NAME = re.compile(r"[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?")
+_DNS_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
+_PLUGIN_LABELS = ("app.kubernetes.io/managed-by", "app.kubernetes.io/component")
+_PLUGIN_LABEL_PREFIX = "hermes-sandbox/"
+# Characters a git_credentials url may never contain: it lands in a git config key and an env value.
+_GIT_URL_BAD_CHAR = re.compile(r"[\s\"'\\\x00-\x1f\x7f]")
+_GIT_USER = re.compile(r"[A-Za-z0-9._@+-]{1,128}")
+# Variables a sandbox must never receive from the gateway: they change how the shell, the dynamic
+# loader or Python start (BASH_ENV, LD_PRELOAD, PYTHONSTARTUP, ...) or point the sandbox at the
+# gateway's cluster or Hermes itself; bash's readonly and special variables, whose assignment fails the
+# runner's environment section (it fails closed, so every command would); and the runner's own `__hs_`
+# variables; and LLM proxy and memory keys Hermes does not classify (WITHHELD_ENV_PREFIXES, also withheld
+# per exec).
+# Secrets Hermes knows about (provider API keys, GITHUB_TOKEN and the like) are withheld per exec by the
+# environment, with Hermes's own credential check, not by this list.
+_DENIED_ENV = frozenset({"BASH_ENV", "ENV", "PATH", "IFS", "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND",
+                         "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "POSIXLY_CORRECT",
+                         "UID", "EUID", "PPID", "BASHPID", "BASH_VERSINFO", "GROUPS", "BASH_ARGV0",
+                         "BASH_SUBSHELL"})
+# LiteLLM proxy keys (LITELLM_API_KEY, LITELLM_MASTER_KEY, ...) and Hindsight memory keys
+# (HINDSIGHT_API_TENANT_API_KEY, ...): Hermes v0.22.1 does not classify them all (R-H20, R-H21).
+WITHHELD_ENV_PREFIXES = ("LITELLM_", "HINDSIGHT_")
+_DENIED_ENV_PREFIXES = ("LD_", "KUBERNETES_", "HERMES_", "__hs_", *WITHHELD_ENV_PREFIXES)
+
+
+def _env_name(where: str, name) -> str:
+    if not isinstance(name, str) or not _SHELL_NAME.fullmatch(name):
+        raise SettingsError(f"{where} must be an environment variable name ([A-Za-z_][A-Za-z0-9_]*), "
+                            f"got {name!r}")
+    if name in _DENIED_ENV or name.startswith(_DENIED_ENV_PREFIXES):
+        raise SettingsError(f"{where}: {name} cannot be forwarded into a sandbox (it changes how the "
+                            "shell, loader or Python start, belongs to Kubernetes or Hermes, or is an LLM "
+                            "or memory key)")
+    return name
+
+
+def _yaml_text(key: str, raw):
+    """Environment overrides arrive as text: JSON or YAML."""
+    if not isinstance(raw, str):
+        return raw
+    try:
+        return safe_load(raw)
+    except YAMLError as e:
+        raise SettingsError(f"{key} is not valid JSON/YAML: {e}") from None
 
 
 def _annotations(raw) -> dict[str, str]:
-    if isinstance(raw, str):  # HERMES_K8S_EXTRA_POD_ANNOTATIONS: JSON or YAML text
-        try:
-            raw = yaml.safe_load(raw)
-        except yaml.YAMLError as e:
-            raise SettingsError(f"extra_pod_annotations is not valid JSON/YAML: {e}") from None
+    raw = _yaml_text("extra_pod_annotations", raw)
     if raw is None:
         return {}
     if not isinstance(raw, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in raw.items()):
@@ -77,11 +166,92 @@ def _annotations(raw) -> dict[str, str]:
     return raw
 
 
+def _labels(raw) -> dict[str, str]:
+    raw = _yaml_text("extra_pod_labels", raw)
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in raw.items()):
+        raise SettingsError("extra_pod_labels must be a mapping of string keys to string values "
+                            "(quote numbers and booleans)")
+    for k, v in raw.items():
+        prefix, _, name = k.rpartition("/")
+        bad_prefix = prefix and (len(prefix) > 253 or not all(_DNS_LABEL.fullmatch(p) for p in prefix.split(".")))
+        if bad_prefix or not _LABEL_NAME.fullmatch(name):
+            raise SettingsError(f"extra_pod_labels: {k!r} is not a valid label key")
+        if v and not _LABEL_NAME.fullmatch(v):
+            raise SettingsError(f"extra_pod_labels: value {v!r} of {k!r} is not a valid label value")
+        if k in _PLUGIN_LABELS or k.startswith(_PLUGIN_LABEL_PREFIX):
+            raise SettingsError(f"extra_pod_labels: {k!r} is set by the plugin itself and cannot be overridden")
+    return dict(raw)
+
+
+def _forward_env(raw) -> tuple[str, ...]:
+    if isinstance(raw, str) and not raw.strip().startswith("["):  # HERMES_K8S_FORWARD_ENV="A,B" or "A B"
+        raw = [x for x in re.split(r"[\s,]+", raw.strip()) if x]
+    raw = _yaml_text("forward_env", raw)
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise SettingsError("forward_env must be a list of environment variable names ([A-Za-z_][A-Za-z0-9_]*)")
+    return tuple(dict.fromkeys(_env_name("forward_env", x) for x in raw))
+
+
+def _git_url(url) -> str | None:
+    """`https://<host>[:port]<path>` without a trailing slash, the host lower-cased (host names are
+    case-insensitive, so duplicates are caught) and an IPv6 literal bracketed; None if not acceptable. Parsed
+    with the standard library's urlsplit (no external dependency), then every part is checked explicitly."""
+    if not isinstance(url, str) or _GIT_URL_BAD_CHAR.search(url) or not url.isascii():
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port  # ValueError: not a number, or outside 0-65535
+    except ValueError:
+        return None
+    if (parts.scheme != "https" or not url.startswith("https://") or "@" in parts.netloc
+            or "?" in url or "#" in url or parts.netloc.endswith(":") or port == 0):
+        return None
+    host = parts.hostname or ""
+    if parts.netloc.startswith("["):
+        try:
+            host = f"[{ipaddress.IPv6Address(host).compressed}]"
+        except ValueError:
+            return None
+    elif not all(_DNS_LABEL.fullmatch(label) for label in host.removesuffix(".").split(".")):
+        return None
+    if any(urllib.parse.unquote(seg) == ".." for seg in parts.path.split("/")):
+        return None
+    return f"https://{host}{f':{port}' if port is not None else ''}{parts.path}".rstrip("/")
+
+
+def _git_credentials(raw) -> tuple[GitCredential, ...]:
+    raw = _yaml_text("git_credentials", raw)
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise SettingsError("git_credentials must be a list of {url, username, password_env}")
+    out = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict) or set(item) != {"url", "username", "password_env"}:
+            raise SettingsError(f"git_credentials[{i}] must have exactly the keys url, username, password_env")
+        url, user, var = item["url"], item["username"], item["password_env"]
+        norm = _git_url(url)
+        if norm is None:
+            raise SettingsError(f"git_credentials[{i}].url must be an https:// URL with a host, optional port and "
+                                f"path, and no user, query, fragment, quotes, spaces or '..' segments, got {url!r}")
+        if not isinstance(user, str) or not _GIT_USER.fullmatch(user):
+            raise SettingsError(f"git_credentials[{i}].username {user!r} may contain only letters, digits and ._@+-")
+        _env_name(f"git_credentials[{i}].password_env", var)
+        out.append(GitCredential(norm, user, var))
+    if len({c.url for c in out}) != len(out):
+        raise SettingsError("git_credentials: each url may appear once")
+    return tuple(out)
+
+
 def _duration(key: str, raw) -> int:
     """Seconds, from an int or `<n>s|m|h|d` ("7d"); bare digits are seconds."""
     if isinstance(raw, int) and not isinstance(raw, bool):
         return raw
-    m = _DURATION.match(raw.strip()) if isinstance(raw, str) else None
+    m = _DURATION.fullmatch(raw.strip()) if isinstance(raw, str) else None
     if not m:
         raise SettingsError(f"{key} must be a whole number of seconds or a duration like 90s, 15m, 36h, 7d; "
                             f"got {raw!r}")
@@ -92,6 +262,12 @@ def _coerce(name: str, raw):
     ftype = _FIELDS[name].type
     if name == "extra_pod_annotations":
         return _annotations(raw)
+    if name == "extra_pod_labels":
+        return _labels(raw)
+    if name == "forward_env":
+        return _forward_env(raw)
+    if name == "git_credentials":
+        return _git_credentials(raw)
     if name == "workspace_retention_seconds":
         return _duration("workspace_retention", raw)
     if isinstance(raw, str):
@@ -124,6 +300,10 @@ def validate(s: Settings) -> Settings:
             raise SettingsError(f"{name} must be positive")
     if s.workspace_retention_seconds <= 0:
         raise SettingsError("workspace_retention must be positive")
+    for c in s.git_credentials:
+        if c.password_env not in s.forward_env:
+            raise SettingsError(f"git_credentials: password_env {c.password_env} for {c.url} must also be "
+                                "listed in forward_env")
     return s
 
 
@@ -132,8 +312,8 @@ def load_settings(home: pathlib.Path) -> Settings:
     path = pathlib.Path(home) / "kubernetes-sandbox.yaml"
     if path.exists():
         try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except yaml.YAMLError as e:
+            data = safe_load(path.read_text(encoding="utf-8"))
+        except YAMLError as e:
             raise SettingsError(f"{path} is not valid YAML: {e}") from None
         if data is None:
             data = {}

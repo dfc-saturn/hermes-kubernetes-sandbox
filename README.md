@@ -31,7 +31,10 @@ server but has not been live-tested.
 
 ## Install
 
-The plugin uses only libraries Hermes already ships (httpx, websockets, PyYAML).
+The plugin uses only libraries Hermes already ships (httpx, websockets, and a YAML loader).
+Tested against Hermes v0.22.1 (pinned in CI). On Hermes v0.22+ the plugin parses settings with
+Hermes's internal `hermes_yaml` module (not a stable plugin API; a rename is caught by the
+registration test at the next pin bump); on older Hermes, PyYAML.
 
 ```sh
 git clone https://github.com/dfcowell/hermes-kubernetes-sandbox "$HERMES_HOME/plugins/kubernetes-sandbox"
@@ -122,6 +125,46 @@ The token file is re-read on every request, so renewing it needs no restart.
 The `work` image must provide GNU bash (the runner uses `read -N` and arrays), GNU coreutils
 (`head -c`, `wc`, `timeout`) and util-linux `setsid` (`--wait`). Hermes's default sandbox image does; busybox-only images do not.
 
+## Credentials in the sandbox
+
+Nothing is forwarded by default. A forwarded value (`forward_env` plus Hermes's
+`terminal.env_passthrough`) is resolved by Hermes for the routed profile on every command and
+travels in the exec's stdin, as `export NAME='quoted value'` lines; the runner evaluates them in
+its own shell before the command, so the command and its children inherit them while no process
+argument (`ps`, `/proc/<pid>/cmdline`), the Pod spec, the exec URL, the session snapshot or the
+workspace volume ever holds them. Only valid shell names are emitted, every value is shell-quoted
+(it arrives verbatim and never executes), and a NUL byte refuses the command. Forwarded and git
+names are excluded from Hermes's session snapshot (a file in the Pod's `/tmp` that every later
+command sources), whether or not profiles are multiplexed. Under a multiplexed gateway a name the
+routed profile does not have is `unset`, so a shared value cannot leak between profiles.
+Credentials Hermes manages and LLM proxy or memory keys are withheld at every command (see
+Settings).
+
+`git_credentials` configures `git` through `GIT_CONFIG_*` environment, so no credential file is
+written. For each entry, git gets command-scope configuration through `GIT_CONFIG_COUNT` /
+`GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` (git 2.31 or newer in the work image):
+`credential.<url>.helper` is first set to the empty string, which resets every helper inherited
+from the image's or the user's configuration (so no `store` helper writes the token), then to a
+shell helper that exits 0 without output for every action other than `get` (`store`, `erase`), and
+answers `get` with `printf '%s\n' 'username=<username>'` and `printf 'password=%s\n'
+"${<password_env>:?<password_env> is not forwarded into this sandbox}"`. `printf`, not `echo`: the
+image's `/bin/sh` may be dash, whose `echo` interprets backslashes in the token. The helper text
+names the variable, never its value; an unset or empty variable fails the helper with that message,
+and `GIT_TERMINAL_PROMPT=0` makes the failure final instead of prompting.
+
+**Threat model.** The plugin never *writes* a forwarded token anywhere: not into the Pod spec, the
+workspace PVC, git configuration files or the session snapshot. The agent, however, *can read* it
+(its own environment, `/proc/<pid>/environ`) and could persist it itself, for example with
+`git -c credential.helper=store`, `GIT_TRACE_REDACT=0`, or a plain `echo "$FORGE_TOKEN" > file`. So
+"the token is absent from disk" is a property of the plugin, not a guarantee about the agent: give a
+forwarded token the narrowest scope that works, and treat it as available to everything the agent
+runs. Dangerous-command approvals stay on (`skip_container_guards` is always false), whenever and
+however credentials are forwarded: a forwarded token makes a destructive command more
+consequential, not less.
+
+**Egress.** Reaching the forge usually also needs an egress rule: label the sandbox Pods with
+`extra_pod_labels` and select that label in an extra policy (`examples/kata/networkpolicy.yaml`).
+
 ## Operating: node drains and force-deletes
 
 Sandbox Pods are bare Pods with `emptyDir` volumes, so `kubectl drain` refuses them by default
@@ -165,7 +208,7 @@ force-detaches it (about 6 minutes); see Known limits.
 
 Read from `$HERMES_HOME/kubernetes-sandbox.yaml` (optional); every key can be set or overridden by
 the environment variable `HERMES_K8S_<KEY in upper case>`, e.g. `HERMES_K8S_MAX_PER_PROFILE=3`.
-Unknown keys are an error. Booleans accept `1/0`, `true/false`, `yes/no`, `on/off`; an empty value
+Unknown keys and duplicate keys are an error. Booleans accept `1/0`, `true/false`, `yes/no`, `on/off`; an empty value
 for a nullable key means "unset".
 
 | Key | Default | Meaning |
@@ -195,6 +238,31 @@ for a nullable key means "unset".
 | `token_path` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Bearer token file (re-read per request). |
 | `ca_path` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | CA bundle; empty = system trust. A configured path that does not exist fails `check_requirements`. |
 | `extra_pod_annotations` | `{}` | Extra Pod annotations, string to string. From the environment: JSON or YAML text. |
+| `extra_pod_labels` | `{}` | Extra Pod labels, string to string (e.g. the selector of an opt-in egress policy). Keys and values must be valid Kubernetes labels; the plugin's own label keys (`hermes-sandbox/*`, `app.kubernetes.io/managed-by`, `app.kubernetes.io/component`) are refused. In the template hash only when set. From the environment: JSON or YAML text. |
+| `forward_env` | `[]` | Variable names forwarded into every command, on top of Hermes's `terminal.env_passthrough` (both resolved per routed profile). List only what the sandbox needs; see below for what can't be forwarded. From the environment: a JSON/YAML list, or names separated by commas or spaces. |
+| `git_credentials` | `[]` | One `{url, username, password_env}` per forge: in-sandbox `git` authenticates to `url` as `username` with the value of `password_env`, which must also be listed in `forward_env`. `url` is `https://<host>[:port][/path]`: a DNS name (a trailing dot is kept) or a bracketed IPv6 literal, an explicit port is kept, ASCII only (percent-encode the path), with no user part, query, fragment, `..` segment (encoded or not), whitespace, quotes, backslashes or control characters. It is stored without a trailing slash and the host is compared case-insensitively. From the environment: JSON or YAML text. See "Credentials in the sandbox". |
+
+`forward_env` and `password_env` refuse names that change how a shell, the dynamic loader or Python
+start, that belong to Kubernetes or Hermes, that the sandbox's command runner cannot assign, or that
+are LLM proxy or memory keys: `LD_*`, `BASH_ENV`, `ENV`, `PATH`, `IFS`, `SHELLOPTS`, `BASHOPTS`, `PS4`,
+`PROMPT_COMMAND`, `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`, `POSIXLY_CORRECT`, `KUBERNETES_*`,
+`HERMES_*`, bash's readonly and special variables (`UID`, `EUID`, `PPID`, `BASHPID`, `BASH_VERSINFO`,
+`GROUPS`, `BASH_ARGV0`, `BASH_SUBSHELL`), the runner's own `__hs_*`, `LITELLM_*` and `HINDSIGHT_*`.
+
+Credentials are also withheld at every command, from every forwarded name, including names that
+arrive through Hermes's `terminal.env_passthrough` rather than `forward_env`:
+
+- secrets Hermes manages itself, by Hermes's own credential check: LLM provider and tool API keys,
+  `GITHUB_TOKEN`/`GH_TOKEN`, memory and messaging-adapter keys, `AUXILIARY_*_API_KEY` ... (Hermes's
+  docker backend lets an explicit `docker_forward_env` bypass that check; this plugin does not);
+- `LITELLM_*` (e.g. `LITELLM_API_KEY`, `LITELLM_MASTER_KEY`): LiteLLM proxy keys, which Hermes
+  does not classify;
+- `HINDSIGHT_*` (e.g. `HINDSIGHT_API_TENANT_API_KEY`): keys of Hermes's Hindsight memory provider,
+  of which Hermes classifies only some.
+
+Each withheld name is logged once. If Hermes's check cannot be loaded or fails, every name it would
+judge is withheld (and logged each time). Name a forge token something Hermes does not manage
+(e.g. `FORGE_TOKEN`).
 
 Changing a setting that affects the Pod template replaces existing sandbox Pods on their next
 command (template-hash label), with the `environment_recreated` notice; the workspace volume is
@@ -202,9 +270,9 @@ kept.
 
 ## Development and validation
 
-    uv venv -p 3.13 .venv
+    uv venv -p 3.14 .venv
     git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git .hermes-src
-    git -C .hermes-src checkout --quiet 524041b9d0437cd4424a524af4b9e26145e69ab0
+    git -C .hermes-src checkout --quiet 297552a9d646119871391d202509822cd86330df
     uv pip install --python .venv -e .hermes-src pytest==9.1.1 ruff==0.15.10
     .venv/bin/ruff check . && .venv/bin/pytest
 
@@ -222,9 +290,10 @@ kept.
 rather than a dependency on the official `kubernetes` package or another client library:
 
 - **No new dependencies.** A Hermes plugin is installed as a directory, with no dependency
-  installation step. The plugin uses only `httpx`, `websockets` and PyYAML, which Hermes already
-  ships as pinned core dependencies. A client library would have to become a Hermes core
-  dependency, or be fetched from PyPI at runtime, unpinned, on a security-sensitive path.
+  installation step. The plugin uses only `httpx`, `websockets` and a YAML loader, which Hermes
+  already ships as pinned core dependencies (YAML: Hermes's internal `hermes_yaml` module on
+  v0.22+, not a stable plugin API; PyYAML on older Hermes — see Install). A client library would have to become a Hermes core dependency, or be
+  fetched from PyPI at runtime, unpinned, on a security-sensitive path.
 - **The API surface is small.** Get, list, create, patch and delete for Pods and PVCs (PVC
   deletes carry uid/resourceVersion preconditions), plus exec. The token file is re-read on every request, so a
   rotating projected ServiceAccount token works without a refresh mechanism.

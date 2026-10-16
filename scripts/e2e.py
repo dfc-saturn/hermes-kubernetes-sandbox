@@ -11,11 +11,17 @@ Which namespace/runtime is exercised (Kata ``agent-sandbox``, runc ``agent-sandb
 is decided entirely by the settings file.
 
 Prints only PASS/FAIL lines with short details (never the token or exec payloads). Exit 0 iff
-every check passed. The Pod and the session's workspace PVC are always deleted at the end; the
-driver Role has no PVC delete, so with a driver token the PVC deletion is refused and the script
-prints the kubectl command to remove it (a WARN line, not a failed check).
+every check passed. The probe variable E2E_FORWARDED_TOKEN is forwarded through the documented
+HERMES_K8S_FORWARD_ENV override (the file's own forward_env plus the probe), so it passes the same
+validation as an operator's setting. The Pod and the session's workspace PVC are always deleted at
+the end: with a driver Role that has PVC delete the script deletes the PVC itself ("deleted
+workspace PVC ..."); without it the deletion is refused and the script prints the kubectl command
+to remove it (a WARN line, not a failed check).
 """
+import json
+import os
 import pathlib
+import re
 import secrets
 import shutil
 import sys
@@ -40,11 +46,29 @@ def main(argv: list[str]) -> int:
     from kubernetes_sandbox.environment import KubernetesEnvironment
     from kubernetes_sandbox.kube import NotFound
     from kubernetes_sandbox.naming import Identity
-    from kubernetes_sandbox.settings import load_settings
+    from kubernetes_sandbox.settings import SettingsError, load_settings
 
+    # The forwarded-value probe goes through the real settings path, exactly as an operator would configure
+    # it: the documented HERMES_K8S_FORWARD_ENV override, carrying the file's own forward_env plus the probe.
+    fwd = "E2E_FORWARDED_TOKEN"
+    os.environ[fwd] = "e2e-" + secrets.token_hex(16)
     with tempfile.TemporaryDirectory() as home:
         shutil.copy(src, pathlib.Path(home) / "kubernetes-sandbox.yaml")
         s = load_settings(pathlib.Path(home))
+        prev = os.environ.get("HERMES_K8S_FORWARD_ENV")
+        os.environ["HERMES_K8S_FORWARD_ENV"] = ",".join(dict.fromkeys((*s.forward_env, fwd)))
+        s = load_settings(pathlib.Path(home))
+        # Negative control: a denylisted credential name is refused by the same path.
+        os.environ["HERMES_K8S_FORWARD_ENV"] = ",".join(dict.fromkeys((*s.forward_env, "LITELLM_API_KEY")))
+        try:
+            load_settings(pathlib.Path(home))
+            denied = "accepted"
+        except SettingsError as e:
+            denied = "refused" if "LITELLM_API_KEY cannot be forwarded" in str(e) else f"other error: {e}"
+        if prev is None:
+            del os.environ["HERMES_K8S_FORWARD_ENV"]
+        else:
+            os.environ["HERMES_K8S_FORWARD_ENV"] = prev
 
     env = KubernetesEnvironment(settings=s, identity=Identity("e2e", f"run-{int(time.time())}"),
                                 cwd="/workspace", timeout=120)
@@ -62,6 +86,8 @@ def main(argv: list[str]) -> int:
         check(f"{which} Pod gone after a graceful delete", gone, "" if gone else "still terminating")
 
     try:
+        check(f"forward_env {fwd} accepted by load_settings", fwd in s.forward_env)
+        check("forward_env LITELLM_API_KEY refused by load_settings", denied == "refused", denied)
         t0 = time.time()
         r = env.execute("echo ready")  # first execute creates the Pod and builds the snapshot
         check("pod ready + session snapshot + first command",
@@ -85,6 +111,22 @@ def main(argv: list[str]) -> int:
               f"returncode={r['returncode']}")
         r = env.execute("exit 9")
         check("exit code", r["returncode"] == 9, f"returncode={r['returncode']}")
+        val = os.environ[fwd]
+        r = env.execute(f'printf "%s\\n" "${fwd}"')
+        check("forwarded variable reaches the command", r["output"].strip().endswith(val))
+        r = env.execute('for f in /proc/[0-9]*/cmdline; do tr "\\0" " " < "$f" 2>/dev/null; echo; done '
+                        f'| grep -c -F -f <(printf "%s\\n" "${fwd}") || true; '
+                        f'grep -rlF -f <(printf "%s\\n" "${fwd}") /workspace /tmp 2>/dev/null | wc -l')
+        tail = r["output"].strip().splitlines()[-2:]
+        check("forwarded value in no process argv and no file under /workspace or /tmp", tail == ["0", "0"],
+              " ".join(tail))
+        check("forwarded value absent from the Pod object",
+              val not in json.dumps(env._client.get_pod(env._id.pod_name)))
+        # git_credentials configures git through GIT_CONFIG_* environment, which needs git >= 2.31.
+        r = env.execute("git --version")
+        m = re.search(r"git version (\d+)\.(\d+)", r["output"])
+        check("work image git >= 2.31 (GIT_CONFIG_* credentials)",
+              m is not None and (int(m[1]), int(m[2])) >= (2, 31), r["output"].strip()[-40:])
         if s.docker:
             r = env.execute("docker run --rm alpine:3.24.2 echo hello-from-inner", timeout=300)
             check("docker run", "hello-from-inner" in r["output"], r["output"].strip()[-100:])

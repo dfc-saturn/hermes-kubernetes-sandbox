@@ -1,3 +1,4 @@
+import json
 import threading
 
 import pytest
@@ -7,7 +8,8 @@ from kubernetes_sandbox.environment import KubernetesEnvironment
 from kubernetes_sandbox.kube import Conflict
 from kubernetes_sandbox.naming import ANN_SESSION_KEY, LBL_TEMPLATE_HASH, Identity
 from kubernetes_sandbox.podspec import render_pod, template_hash
-from kubernetes_sandbox.settings import Settings
+from kubernetes_sandbox.runner import stdin_payload
+from kubernetes_sandbox.settings import GitCredential, Settings
 from tools.environments.base import EnvironmentConnectionError
 
 S = Settings(runtime_class_name="kata", docker_disk_storage_class="b", ready_timeout_seconds=5)
@@ -989,3 +991,244 @@ def test_pvc_quota_hint_names_count_and_storage():
     with pytest.raises(EnvironmentConnectionError) as ei:
         e.ensure_pod()
     assert "PVC count" in ei.value.retry_hint and "storage" in ei.value.retry_hint
+
+
+def test_wait_for_process_forwards_every_base_keyword(monkeypatch):
+    """Hermes grows _wait_for_process parameters between releases (v0.22: `output`); the override must pass
+    them through instead of failing with TypeError."""
+    from tools.environments.base import BaseEnvironment
+    seen = {}
+
+    def fake_base(self, proc, timeout=120, **kwargs):
+        seen.update(kwargs, timeout=timeout)
+        return {"output": "", "returncode": 0}
+
+    monkeypatch.setattr(BaseEnvironment, "_wait_for_process", fake_base)
+    e, _, _ = _env()
+
+    class Proc:
+        error = None
+        _killed = None
+
+    assert e._wait_for_process(Proc(), 7, output="collector", bounded_capture=True)["returncode"] == 0
+    assert seen == {"timeout": 7, "output": "collector", "bounded_capture": True}
+
+
+FWD = Settings(runtime_class_name="kata", docker_disk_storage_class="b", ready_timeout_seconds=5,
+               forward_env=("HS_FWD_TEST",),
+               git_credentials=(GitCredential("https://forge.example.test", "my-bot", "HS_FWD_TEST"),))
+
+
+def _sections(payload: bytes):
+    n, i, en, rest = payload.split(b"\n", 3)
+    n, i, en = int(n), int(i), int(en)
+    return rest[:n], rest[n:n + en], rest[n + en:]
+
+
+def test_forwarded_values_travel_only_in_the_env_section(monkeypatch):
+    monkeypatch.setenv("HS_FWD_TEST", "v4lue-xyz")
+    e, kube, ex = _env(settings=FWD)
+    e.ensure_pod()
+    e._run_bash("echo hi", login=False, timeout=10).wait(timeout=5)
+    run = ex.runs[-1]
+    script, env, _ = _sections(run["payload"])
+    assert b"export HS_FWD_TEST=v4lue-xyz\n" in env and b"export GIT_CONFIG_COUNT=2\n" in env
+    assert b"v4lue-xyz" not in script
+    assert "v4lue-xyz" not in " ".join(run["argv"])
+    assert "v4lue-xyz" not in json.dumps(kube.pods[ID.pod_name]) and "v4lue-xyz" not in json.dumps(kube.pvcs)
+
+
+def test_names_without_a_value_are_unset(monkeypatch):
+    monkeypatch.delenv("HS_FWD_TEST", raising=False)
+    import kubernetes_sandbox.environment as em
+    monkeypatch.setattr(em, "resolve_passthrough_env", lambda fwd: ({}, {"HS_FWD_TEST", "bad name"}))
+    e, _, _ = _env(settings=FWD)
+    script = e._exec_env_script()
+    assert "unset HS_FWD_TEST\n" in script and "bad name" not in script
+
+
+def test_forwarded_names_are_excluded_from_the_snapshot_without_multiplexing():
+    e, _, _ = _env(settings=FWD)
+    names = e._snapshot_excluded_passthrough_names()
+    assert {"HS_FWD_TEST", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_1", "GIT_TERMINAL_PROMPT"} <= set(names)
+
+
+def test_snapshot_file_never_holds_a_forwarded_value(tmp_path, monkeypatch):
+    """Real bash: the wrapper Hermes builds, run by the real RUNNER with the env section, re-dumps the session
+    snapshot after the command. The snapshot must keep an ordinary export and drop the forwarded one."""
+    from test_runner import _run
+    monkeypatch.setenv("HS_FWD_TEST", "s3cr3t-snap")
+    e, _, _ = _env(settings=FWD)
+    snap = tmp_path / "snap.sh"
+    snap.write_text("")
+    e._snapshot_path = str(snap)
+    e._snapshot_ready = True
+    wrapped = e._wrap_command('export OTHER_VAR=kept; echo "in=$HS_FWD_TEST"', str(tmp_path))
+    p, _ = _run("", payload=stdin_payload(wrapped, None, e._exec_env_script()))
+    assert "in=s3cr3t-snap" in p.stdout.decode(), p.stderr
+    text = snap.read_text()
+    assert "OTHER_VAR" in text and "s3cr3t-snap" not in text
+
+
+# R-H18 (3): hostile values reach the command verbatim through the real RUNNER (bash) and never execute.
+_HOSTILE = ["$(touch {m})", "`touch {m}`", "'; touch {m}; '", "\"; touch {m}; \"", "a\nexport X=1; touch {m}",
+            "\\n\\x41 $HOME ${{PATH}} !! *", "-n", "tab\there", "ünï ☃", "x' \"$(touch {m})\" '", "", " lead"]
+
+
+@pytest.mark.parametrize("raw", _HOSTILE)
+def test_hostile_forwarded_value_arrives_verbatim_and_never_executes(tmp_path, monkeypatch, raw):
+    from test_runner import _run
+    marker = tmp_path / "pwned"
+    value = raw.format(m=marker)
+    monkeypatch.setenv("HS_FWD_TEST", value)
+    e, _, _ = _env(settings=FWD)
+    env_script = e._exec_env_script()
+    p, _ = _run('printf %s "$HS_FWD_TEST"', env_script=env_script)
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.decode("utf-8") == value
+    assert not marker.exists()
+
+
+def test_env_section_names_are_validated_and_values_quoted(monkeypatch):
+    import kubernetes_sandbox.environment as em
+    monkeypatch.setattr(em, "resolve_passthrough_env", lambda fwd: (
+        {"HS_FWD_TEST": "a b", "bad name": "x", "X;touch /tmp/y": "x", "OK\n": "x"}, {"also bad"}))
+    e, _, _ = _env(settings=FWD)
+    script = e._exec_env_script()
+    lines = script.splitlines()
+    assert "export HS_FWD_TEST='a b'" in lines
+    assert all(line.startswith(("export GIT_", "export HS_FWD_TEST=")) for line in lines), lines
+    assert "bad" not in script and "touch" not in script and "OK" not in script
+
+
+def test_nul_in_a_forwarded_value_is_refused_end_to_end(monkeypatch):
+    import kubernetes_sandbox.environment as em
+    monkeypatch.setattr(em, "resolve_passthrough_env", lambda fwd: ({"HS_FWD_TEST": "se\0cret"}, set()))
+    e, _, ex = _env(settings=FWD)
+    e.ensure_pod()
+    with pytest.raises(ValueError, match="NUL") as ei:
+        e._run_bash("echo hi", login=False, timeout=10)
+    assert "cret" not in str(ei.value)
+    assert ex.runs == []
+
+
+@pytest.mark.parametrize("secret", ["OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AUXILIARY_VISION_API_KEY"])
+def test_hermes_declared_secret_in_forward_env_is_not_forwarded(monkeypatch, secret):
+    """R-H17 (b): against Hermes v0.22.1's real resolve_passthrough_env and credential predicates, no mock.
+    Hermes treats explicit forwards (docker_forward_env) as an operator opt-in that bypasses its scrub, so the
+    plugin applies Hermes's own credential check to forward_env before asking Hermes to resolve it."""
+    from tools.environments.remote_common import resolve_passthrough_env
+    monkeypatch.setenv(secret, "s3cr3t-declared")
+    monkeypatch.setenv("HS_FWD_TEST", "plain-value")
+    assert resolve_passthrough_env((secret,))[0] == {secret: "s3cr3t-declared"}  # Hermes alone WOULD forward it
+    s = Settings(runtime_class_name="kata", docker_disk_storage_class="b", forward_env=(secret, "HS_FWD_TEST"))
+    e, _, _ = _env(settings=s)
+    script = e._exec_env_script()
+    assert "s3cr3t-declared" not in script and secret not in script
+    assert "export HS_FWD_TEST=plain-value\n" in script
+    assert secret in e._snapshot_excluded_passthrough_names()
+
+
+def test_litellm_keys_are_withheld_per_exec_even_when_implicit(_isolated_hermes_home, monkeypatch):
+    """R-H20 (b): Hermes v0.22.1 does not classify LITELLM_* keys, so the plugin withholds them itself, on every
+    name the resolver returns: here they arrive IMPLICITLY via the real terminal.env_passthrough (config.yaml),
+    never passing through forward_env, and directly via a forward_env that bypassed settings validation."""
+    (_isolated_hermes_home / "config.yaml").write_text(
+        "terminal:\n  env_passthrough: [LITELLM_API_KEY, HS_IMPLICIT]\n")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-litellm-implicit")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-litellm-master")
+    monkeypatch.setenv("HS_IMPLICIT", "implicit-ok")
+    from tools.env_passthrough import get_all_passthrough
+    assert {"LITELLM_API_KEY", "HS_IMPLICIT"} <= get_all_passthrough()  # precondition: Hermes passes both
+    s = Settings(runtime_class_name="kata", docker_disk_storage_class="b", forward_env=("LITELLM_MASTER_KEY",))
+    e, _, _ = _env(settings=s)
+    script = e._exec_env_script()
+    assert "export HS_IMPLICIT=implicit-ok\n" in script
+    assert "sk-litellm" not in script and "LITELLM_API_KEY=" not in script and "LITELLM_MASTER_KEY=" not in script
+    assert {"LITELLM_API_KEY", "LITELLM_MASTER_KEY"} <= set(e._snapshot_excluded_passthrough_names())
+
+
+def test_hindsight_keys_are_withheld_per_exec_even_when_implicit(_isolated_hermes_home, monkeypatch):
+    """R-H21: Hermes v0.22.1 does not classify HINDSIGHT_* (its catalog memory provider's keys), so the plugin
+    withholds them itself on every exec: implicitly via terminal.env_passthrough and via a forward_env that
+    bypassed settings validation. Memory keys never enter a sandbox."""
+    (_isolated_hermes_home / "config.yaml").write_text(
+        "terminal:\n  env_passthrough: [HINDSIGHT_API_TENANT_API_KEY, HS_IMPLICIT]\n")
+    monkeypatch.setenv("HINDSIGHT_API_TENANT_API_KEY", "hs-tenant-implicit")
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "hs-api-explicit")
+    monkeypatch.setenv("HS_IMPLICIT", "implicit-ok")
+    from tools.env_passthrough import _is_hermes_provider_credential, get_all_passthrough
+    assert {"HINDSIGHT_API_TENANT_API_KEY", "HS_IMPLICIT"} <= get_all_passthrough()  # precondition: Hermes passes
+    assert not _is_hermes_provider_credential("HINDSIGHT_API_TENANT_API_KEY")  # precondition: Hermes doesn't classify
+    s = Settings(runtime_class_name="kata", docker_disk_storage_class="b", forward_env=("HINDSIGHT_API_KEY",))
+    e, _, _ = _env(settings=s)
+    script = e._exec_env_script()
+    assert "export HS_IMPLICIT=implicit-ok\n" in script
+    assert "hs-tenant" not in script and "hs-api" not in script and "HINDSIGHT_" not in script
+    assert {"HINDSIGHT_API_TENANT_API_KEY", "HINDSIGHT_API_KEY"} <= set(e._snapshot_excluded_passthrough_names())
+
+
+def test_real_predicate_forwards_an_unclassified_token():
+    """R-H20 I3 positive control against Hermes's REAL credential check: a forge token name Hermes does not
+    manage IS forwarded. A Hermes bump that starts classifying *_TOKEN shapes fails here."""
+    import os
+    s = Settings(runtime_class_name="kata", docker_disk_storage_class="b", forward_env=("ACME_FORGE_TOKEN",))
+    e, _, _ = _env(settings=s)
+    os.environ["ACME_FORGE_TOKEN"] = "forge-tok"
+    try:
+        assert "export ACME_FORGE_TOKEN=forge-tok\n" in e._exec_env_script()
+    finally:
+        del os.environ["ACME_FORGE_TOKEN"]
+
+
+def _broken_predicate(monkeypatch, how):
+    import sys
+    import types
+    if how == "missing":
+        monkeypatch.setitem(sys.modules, "tools.env_passthrough", None)  # import raises ImportError
+    else:
+        mod = types.ModuleType("tools.env_passthrough")
+
+        def boom(name):
+            raise RuntimeError("registry unavailable")
+        mod._is_hermes_provider_credential = boom
+        mod.get_all_passthrough = lambda: frozenset()
+        monkeypatch.setitem(sys.modules, "tools.env_passthrough", mod)
+
+
+@pytest.mark.parametrize("how", ["missing", "raising"])
+def test_unclassifiable_names_are_withheld(monkeypatch, caplog, how):
+    """R-H20 I2: if Hermes's credential check cannot be imported or raises, NO forward_env name or value is
+    emitted (fail closed), with a distinct log line, and the name is not marked as warned (it is retried)."""
+    monkeypatch.setenv("HS_FWD_TEST", "v4lue-closed")
+    _broken_predicate(monkeypatch, how)
+    s = Settings(runtime_class_name="kata", docker_disk_storage_class="b", forward_env=("HS_FWD_TEST",))
+    e, _, _ = _env(settings=s)
+    with caplog.at_level("WARNING"):
+        script = e._exec_env_script()
+    assert "HS_FWD_TEST" not in script and "v4lue-closed" not in script
+    assert caplog.text.count("cannot classify HS_FWD_TEST") == 1  # one warning per name per exec
+    assert "v4lue-closed" not in caplog.text
+    assert "HS_FWD_TEST" not in envmod._WITHHELD_WARNED
+
+
+def test_explicit_withheld_name_is_resolved_but_never_emitted(monkeypatch, caplog):
+    """Operator review: one withheld check, AFTER resolution, covers explicit forward_env names (here a
+    Hermes-classified name that bypassed load-time validation) and implicit ones alike. The REAL Hermes resolver
+    sees and resolves the name; its value never reaches the env section."""
+    import kubernetes_sandbox.environment as em
+    real = em.resolve_passthrough_env
+    seen = {}
+
+    def spy(fwd):
+        seen["fwd"], seen["out"] = list(fwd), real(fwd)
+        return seen["out"]
+    monkeypatch.setattr(em, "resolve_passthrough_env", spy)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-resolved-not-sent")
+    s = Settings(runtime_class_name="kata", docker_disk_storage_class="b", forward_env=("OPENAI_API_KEY",))
+    e, _, _ = _env(settings=s)
+    with caplog.at_level("WARNING"):
+        script = e._exec_env_script()
+    assert seen["fwd"] == ["OPENAI_API_KEY"] and seen["out"][0] == {"OPENAI_API_KEY": "sk-resolved-not-sent"}
+    assert "sk-resolved-not-sent" not in script and "OPENAI_API_KEY" not in script
+    assert "sk-resolved-not-sent" not in caplog.text
