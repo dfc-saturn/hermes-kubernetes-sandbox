@@ -41,7 +41,28 @@ git clone https://github.com/dfcowell/hermes-kubernetes-sandbox "$HERMES_HOME/pl
 hermes plugins enable kubernetes-sandbox
 # write $HERMES_HOME/kubernetes-sandbox.yaml (or set HERMES_K8S_* variables), then:
 hermes config set terminal.backend kubernetes
+hermes config set terminal.cwd /workspace
 ```
+
+**Set `terminal.cwd: /workspace`.** This is the fix. Without it Hermes runs every command of a
+non-local backend in its built-in default cwd (`/root` in v0.22.1, an inline fallback in
+`tools/terminal_tool.py` `_resolve_config_cwd`), which the sandbox user (UID 1000) cannot enter.
+A `terminal.cwd` keeps Hermes's own cwd planning, the session's recorded cwd and the system prompt
+pointing at the persistent workspace.
+
+As a backstop the plugin maps Hermes's default cwd to the environment's starting directory
+(`/workspace`), at creation and per command, so commands still work without it. It keeps no copy of
+that default: it asks Hermes's own resolver for this backend under the profile's terminal scope, so
+a Hermes patch that moves the default is followed with no plugin change. Without a usable answer
+(a renamed resolver, an unexpected return value, an empty `terminal.cwd`, or an unreadable terminal
+policy) it does not guess: nothing is mapped and a warning is logged once per profile. The cwd
+Hermes passes at environment creation is never taken for the default, since it can be an ACP or
+gateway override or the session's recorded cwd.
+With a usable `terminal.cwd` configured nothing is mapped either; Hermes never plans its default then. `hermes doctor`
+reports a hard FAIL row when `terminal.cwd` is unset or outside `/workspace` (its API has no warning
+tier, although commands still work); the backend's requirements check only logs a warning, once per
+profile. An
+explicit `workdir` on a command is honoured as given (`/root/...` subdirectories included).
 
 Then set up the cluster side from one of the examples:
 
@@ -55,6 +76,23 @@ Then set up the cluster side from one of the examples:
 thing that deletes workspace volumes (see below). It also reaps idle Pods, finished Pods, Pods
 left behind by a crashed gateway and Pods past `max_lifetime_seconds` (the janitor is what
 enforces the `hermes-sandbox/max-lifetime-seconds` annotation the plugin writes).
+
+### System-prompt probe
+
+Hermes describes a remote backend in the system prompt by building a throwaway environment
+(`task_id="prompt-backend-probe"`), running `uname` in it and tearing it down, once per profile per
+gateway process (`agent/prompt_builder.py`, `_run_backend_probe`). For this backend that would be a
+whole sandbox: a Pod cold start blocking the prompt build (about 40 s on Kata), a second Pod next
+to the session's own and a workspace volume left for the janitor. The plugin answers the probe with
+a Pod-less stub instead (`kubernetes_sandbox/probe.py`): it reports `os=Linux` and an unknown
+kernel, so the prompt says `OS: Linux`, and touches nothing in the cluster. Hermes v0.22.1 passes
+`probe_only=True` for the probe but drops it before it reaches a plugin provider, so the literal
+task_id is the signal; the stub also honours `probe_only` for when Hermes forwards it. The test
+`test_hermes_still_drops_probe_only_for_plugins` fails on purpose when Hermes starts forwarding
+`probe_only`: that is a beneficial change, so make `probe_only` the primary signal (the task_id
+check can stay as the fallback) and update the test.
+**A Hermes bump must re-check that literal against `agent/prompt_builder.py`**:
+`tests/test_hermes_paths.py` pins it against the Hermes under test and fails if it changes.
 
 ## Workspace persistence
 
@@ -352,6 +390,11 @@ fake, so replacing it with a library later stays contained.
 - `cleanup()` runs without the env lock; two concurrent first commands can both run the session
   bootstrap (harmless).
 - The RBAC grants `watch` and `pods/log`, reserved for later use.
+- The system-prompt probe is answered without a Pod, so the prompt does not report the sandbox's
+  kernel (under Kata it would be the guest's anyway).
+- Without `terminal.cwd`, a command whose explicit cwd is exactly Hermes's default (`/root`) runs in
+  `/workspace` (Hermes's default cwd cannot be told apart from a deliberate one; the sandbox user
+  cannot enter `/root` either way).
 - `docker_cli: init-copy` copies `cli-plugins/docker-*`; an image with an empty plugins
   directory fails the glob.
 - Creating a Pod can wait up to `ready_timeout_seconds` on the caller's thread and is not

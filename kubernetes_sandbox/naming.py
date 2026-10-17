@@ -5,6 +5,8 @@ import dataclasses
 import hashlib
 import re
 
+# The work container's persistent volume (and workingDir); see podspec.py.
+WORKSPACE = "/workspace"
 PREFIX = "hermes-sandbox/"
 MANAGED_BY = {"app.kubernetes.io/managed-by": "hermes-kubernetes-sandbox"}
 ANN_SESSION_KEY = PREFIX + "session-key"

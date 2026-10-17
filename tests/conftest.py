@@ -21,3 +21,10 @@ def _fresh_served_pods():
     yield
     environment._SERVED_PODS.clear()
     environment._ACCESS_WARNED.clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cwd_warned():
+    from kubernetes_sandbox import provider
+    provider._CWD_WARNED.clear()
+    provider._DEFAULT_CWD_UNKNOWN.clear()
